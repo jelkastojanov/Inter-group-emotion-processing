@@ -1,0 +1,368 @@
+---
+title: "Experiments 1 & 2 (Main analyses)"
+output: html_document
+date: '2022-11-14'
+---
+
+#### Load packages
+
+```{r}
+library(afex)
+library(car)
+library(data.table)
+library(DescTools)
+library(dplyr)
+library(emmeans)
+library(eigenmodel)
+library(ggplot2)
+library(Hmisc)
+library(janitor)
+library(lmerTest)
+library(lme4) 
+library(lsmeans)
+library(maditr)
+library(MPsychoR)
+library(openxlsx)
+library(patchwork)
+library(ppcor)
+library(purrr)
+library(qgraph)
+library(readr)
+library(readxl)
+library(rmcorr)
+library(rhdf5)
+library(Routliers)
+library(simr)
+library(stringi)
+library(Superpower)
+library(tidyr)
+library(tidyverse) 
+library(zoo)
+
+# Define a helper function & remove scientific notation
+`%notin%` <- Negate(`%in%`)
+options(scipen = 999)
+```
+
+#### Load files
+
+```{r}
+# selfReportStudy1 <- ""
+# selfReportTaskStudy1 <- ""
+Study1_SR <- read.csv(selfReportStudy1)
+Study1_SR_T <- read.csv(selfReportTaskStudy1)
+
+Study1_SR_T$identityNew <- substr(Study1_SR_T$emotionalImage, 1, nchar(Study1_SR_T$emotionalImage) - 7) 
+
+# selfReportStudy2 <- ""
+# selfReportTaskStudy2 <- ""
+Study2_SR <- read.csv(selfReportStudy2)
+Study2_SR_T <- read.csv(selfReportTaskStudy2)
+
+# Exclusions based on attention checks
+
+# Study 1
+summaryAC <- Study1_SR_T %>%
+  group_by(participantID) %>%
+  summarise(accTeam = sum(teamResponseAccuracy, na.rm = TRUE) / n(), accGame = sum(gameResponseAccuracy, na.rm = TRUE) / n())
+
+sort(summaryAC$accTeam)
+sort(summaryAC$accGame)
+
+# Two participants are excluded due to attention check mistakes
+Study1_SRClean <- Study1_SR %>%
+  filter(participantID %notin% c(101, 102))
+
+Study1_SR_TClean <- Study1_SR_T %>%
+  filter(participantID %notin% c(101, 102))
+
+# Study 2
+Study2_SR_T$attentionCheckTeamVal <-
+  if_else(Study2_SR_T$attentionCheckTeam == "Correct", 1, 0)
+
+Study2_SR_T$attentionCheckGameVal <-
+  if_else(Study2_SR_T$attentionCheckGame == "Correct", 1, 0)
+
+# No participants were excluded
+Study2_SR_T %>% 
+  group_by(participantID) %>%
+  summarise(meanTeam = mean(attentionCheckTeamVal), meanGame = mean(attentionCheckGameVal))
+```
+
+#### STUDY 1
+
+```{r}
+modelsStudy1 <- list()
+
+##### CONTINUOUS RESPONSES
+
+# Valence responses (Emotional image)
+modelsStudy1$valenceCombined <- lmer(ratingValence ~ group * condition * emotion + (1 | participantID) + (1|emotionalImage),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$valenceCombined)
+anova(modelsStudy1$valenceCombined)
+
+summary(lsmeans(modelsStudy1$valenceCombined, pairwise ~ emotion, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+summary(lsmeans(modelsStudy1$valenceCombined, pairwise ~ group, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+summary(lsmeans(modelsStudy1$valenceCombined, pairwise ~ condition, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Valence responses (Identity)
+modelsStudy1$valenceCombinedIdentity <- lmer(ratingValence ~ group * condition * emotion + (1 + emotion|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$valenceCombinedIdentity)
+anova(modelsStudy1$valenceCombinedIdentity)
+
+summary(lsmeans(modelsStudy1$valenceCombinedIdentity, pairwise ~ emotion, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+summary(lsmeans(modelsStudy1$valenceCombinedIdentity, pairwise ~ group, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+summary(lsmeans(modelsStudy1$valenceCombinedIdentity, pairwise ~ condition, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Arousal responses (Identity)
+modelsStudy1$arousalCombinedIdentity <- lmer(ratingArousal ~ group * condition * emotion + (1 + emotion|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$arousalCombinedIdentity)
+anova(modelsStudy1$arousalCombinedIdentity)
+
+summary(lsmeans(modelsStudy1$arousalCombinedIdentity, pairwise ~ emotion, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Genuineness responses (Identity)
+modelsStudy1$genuinenessCombinedIdentity <- lmer(ratingGenuineness ~ group * condition * emotion + (1 + emotion|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$genuinenessCombinedIdentity)
+anova(modelsStudy1$genuinenessCombinedIdentity)
+
+summary(lsmeans(modelsStudy1$genuinenessCombinedIdentity, pairwise ~ emotion, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+##### IDENTIFICATION / GAME PREFERENCE
+
+# Examine if identification scores make a difference
+Study1_SR_TClean$CI_connected_ingroup <-
+  if_else(Study1_SR_TClean$team == "Blue", Study1_SR_TClean$CI_connected_blue, Study1_SR_TClean$CI_connected_red)
+
+Study1_SR_TClean$CI_like_ingroup <-
+  if_else(Study1_SR_TClean$team == "Blue", Study1_SR_TClean$CI_like_blue, Study1_SR_TClean$CI_like_red)
+
+Study1_SR_TClean$CI_value_ingroup <-
+  if_else(Study1_SR_TClean$team == "Blue", Study1_SR_TClean$CI_value_blue, Study1_SR_TClean$CI_value_red)
+
+Study1_SR_TClean$CI_connected_outgroup <-
+  if_else(Study1_SR_TClean$team == "Red", Study1_SR_TClean$CI_connected_blue, Study1_SR_TClean$CI_connected_red)
+
+Study1_SR_TClean$CI_like_outgroup <-
+  if_else(Study1_SR_TClean$team == "Red", Study1_SR_TClean$CI_like_blue, Study1_SR_TClean$CI_like_red)
+
+Study1_SR_TClean$CI_value_outgroup <-
+  if_else(Study1_SR_TClean$team == "Red", Study1_SR_TClean$CI_value_blue, Study1_SR_TClean$CI_value_red)
+
+Study1_SR_TClean$identificationIngroup <- 
+  if_else(Study1_SR_TClean$team == "Blue", Study1_SR_TClean$identificationBlue, Study1_SR_TClean$identificationRed)
+
+Study1_SR_TClean$identificationOutgroup <- 
+  if_else(Study1_SR_TClean$team == "Red", Study1_SR_TClean$identificationBlue, Study1_SR_TClean$identificationRed)
+
+Study1_SR_TClean$identificationInOutDiff <- Study1_SR_TClean$identificationIngroup - Study1_SR_TClean$identificationOutgroup
+
+Study1_SR_TClean$identificationInOutDiff_z <- scale(Study1_SR_TClean$identificationInOutDiff, scale = TRUE, center = TRUE)
+
+# Examine if game preferences make a difference
+Study1_SR_TClean$preferenceDiscrimination <- 
+  ifelse(Study1_SR_TClean$choiceIngroupBinary != Study1_SR_TClean$choiceOutgroupBinary, "Yes", "No")
+
+# Valence (Identification)
+modelsStudy1$valenceCombinedIdentification <- lmer(ratingValence ~ group * condition * emotion + group * identificationInOutDiff_z 
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$valenceCombinedIdentification)
+anova(modelsStudy1$valenceCombinedIdentification)
+
+# Model comparison
+anova(modelsStudy1$valenceCombinedIdentity, modelsStudy1$valenceCombinedIdentification)
+
+# Valence (Game preference)
+Study1_SR_TClean$coalitionalChoice <- 
+  ifelse(Study1_SR_TClean$choiceIngroupBinary == "COOPERATIVE" & Study1_SR_TClean$choiceOutgroupBinary == "COOPERATIVE", "InCoop-OutCoop",
+  ifelse(Study1_SR_TClean$choiceIngroupBinary == "COOPERATIVE" & Study1_SR_TClean$choiceOutgroupBinary == "COMPETITIVE", "InCoop-OutComp",   
+  ifelse(Study1_SR_TClean$choiceIngroupBinary == "COMPETITIVE" & Study1_SR_TClean$choiceOutgroupBinary == "COMPETITIVE", "InComp-OutComp",
+  ifelse(Study1_SR_TClean$choiceIngroupBinary == "COMPETITIVE" & Study1_SR_TClean$choiceOutgroupBinary == "COOPERATIVE", "InComp-OutCoop", 
+         "Mistake"))))  
+
+Study1_SR_TCleanNoInCompOutCoop <- Study1_SR_TClean %>%
+  filter(coalitionalChoice != "InComp-OutCoop")
+
+modelsStudy1$valenceCombinedBaseline <- lmer(ratingValence ~ group * condition * emotion 
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+
+modelsStudy1$valenceCombinedGamePreference <- lmer(ratingValence ~ group * condition * emotion + group * preferenceDiscrimination 
+                                                   + condition * preferenceDiscrimination +
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+summary(modelsStudy1$valenceCombinedGamePreference)
+anova(modelsStudy1$valenceCombinedGamePreference)
+
+summary(lsmeans(modelsStudy1$valenceCombinedGamePreference, pairwise ~ group | preferenceDiscrimination, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Model comparison
+anova(modelsStudy1$valenceCombinedBaseline, modelsStudy1$valenceCombinedGamePreference)
+
+# Arousal (Identification)
+modelsStudy1$arousalCombinedIdentification <- lmer(ratingArousal ~ group * condition * emotion + group * identificationInOutDiff_z +
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+summary(modelsStudy1$arousalCombinedIdentification)
+anova(modelsStudy1$arousalCombinedIdentification)
+
+anova(modelsStudy1$arousalCombinedIdentity, modelsStudy1$arousalCombinedIdentification)
+
+# Arousal (Game preference)
+modelsStudy1$arousalCombinedBaseline <- lmer(ratingArousal ~ group * condition * emotion 
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+
+modelsStudy1$arousalCombinedGamePreference <- lmer(ratingArousal ~ group * condition * emotion + group * preferenceDiscrimination +
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+summary(modelsStudy1$arousalCombinedGamePreference)
+anova(modelsStudy1$arousalCombinedGamePreference)
+
+# Model comparison
+anova(modelsStudy1$arousalCombinedBaseline, modelsStudy1$arousalCombinedGamePreference)
+
+# Genuineness (Identification)
+modelsStudy1$genuinenessCombinedIdentification <- lmer(ratingGenuineness ~ group * condition * emotion + group * identificationInOutDiff_z +
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TClean)
+
+anova(modelsStudy1$genuinenessCombinedIdentification)
+
+anova(modelsStudy1$genuinenessCombinedIdentity, modelsStudy1$genuinenessCombinedIdentification) 
+
+
+# Genuineness (Game preference)
+modelsStudy1$genuinenessCombinedBaseline <- lmer(ratingGenuineness ~ group * condition * emotion 
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+modelsStudy1$genuinenessCombinedGamePreference <- lmer(ratingGenuineness ~ group * condition * emotion + group * preferenceDiscrimination 
+                                                   + condition * preferenceDiscrimination +
+                                                     + (1|participantID) + (1|identityNew),
+                                     data = Study1_SR_TCleanNoInCompOutCoop)
+
+summary(modelsStudy1$genuinenessCombinedGamePreference)
+anova(modelsStudy1$genuinenessCombinedGamePreference)
+
+# Model comparison
+anova(modelsStudy1$genuinenessCombinedBaseline, modelsStudy1$genuinenessCombinedGamePreference)
+```
+
+#### EXPERIMENT 2
+
+```{r}
+modelsStudy2 <- list()
+
+##### CONTINUOUS RESPONSES
+
+# Prepare the game preference responses for inclusion in the model
+Study2_SR_T$preferenceDiscrimination <- 
+  ifelse(Study2_SR_T$choiceIngroupBinary != Study2_SR_T$choiceOutgroupBinary, "Yes", "No")
+
+Study2_SR_T$coalitionalChoice <- 
+  ifelse(Study2_SR_T$choiceIngroupBinary == "COOPERATIVE" & Study2_SR_T$choiceOutgroupBinary == "COOPERATIVE", "InCoop-OutCoop",
+  ifelse(Study2_SR_T$choiceIngroupBinary == "COOPERATIVE" & Study2_SR_T$choiceOutgroupBinary == "COMPETITIVE", "InCoop-OutComp",   
+  ifelse(Study2_SR_T$choiceIngroupBinary == "COMPETITIVE" & Study2_SR_T$choiceOutgroupBinary == "COMPETITIVE", "InComp-OutComp",
+  ifelse(Study2_SR_T$choiceIngroupBinary == "COMPETITIVE" & Study2_SR_T$choiceOutgroupBinary == "COOPERATIVE", "InComp-OutCoop", "Mistake"))))  
+
+# Valence responses (Baseline)
+modelsStudy2$valenceCombined <- lmer(valence ~ group * relations + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+summary(modelsStudy2$valenceCombined)
+anova(modelsStudy2$valenceCombined)
+
+summary(lsmeans(modelsStudy2$valenceCombined, pairwise ~ group, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+summary(lsmeans(modelsStudy2$valenceCombined, pairwise ~ relations, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Valence responses (Identification)
+Study2_SR_T$identificationDiffScore_z <- scale(Study2_SR_T$identificationDiffScore, scale = TRUE, center = TRUE)
+
+modelsStudy2$valenceCombinedIdentification <- 
+  lmer(valence ~ group * relations + group * identificationDiffScore_z + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$valenceCombinedIdentification)
+anova(modelsStudy2$valenceCombined, modelsStudy2$valenceCombinedIdentification)
+probe_interaction(modelsStudy2$valenceCombinedIdentification, pred = identificationDiffScore_z, modx = group)
+
+# Valence responses (Game preference)
+modelsStudy2$valenceCombinedGamePreference <- 
+  lmer(valence ~ group * relations + group * preferenceDiscrimination + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$valenceCombinedGamePreference)
+anova(modelsStudy2$valenceCombined, modelsStudy2$valenceCombinedGamePreference)
+summary(lsmeans(modelsStudy2$valenceCombinedGamePreference, pairwise ~ group | preferenceDiscrimination, cov.reduce = range, adjust = 'holm'), infer = c(TRUE, TRUE))
+
+# Arousal responses (Baseline)
+modelsStudy2$arousalCombined <- lmer(arousal ~ group * relations + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+summary(modelsStudy2$arousalCombined)
+anova(modelsStudy2$arousalCombined)
+
+# Arousal responses (Identification)
+modelsStudy2$arousalCombinedIdentification <- 
+  lmer(arousal ~ group * relations + group * identificationDiffScore_z +(1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$arousalCombinedIdentification)
+anova(modelsStudy2$arousalCombined, modelsStudy2$arousalCombinedIdentification)
+
+# Arousal responses (Game preference)
+modelsStudy2$arousalCombinedGamePreference <- 
+  lmer(arousal ~ group * relations + group * preferenceDiscrimination + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$arousalCombinedGamePreference)
+anova(modelsStudy2$arousalCombined, modelsStudy2$arousalCombinedGamePreference)
+
+# Genuineness responses (Baseline)
+modelsStudy2$genuinenessCombined <- lmer(genuineness ~ group * relations + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+summary(modelsStudy2$genuinenessCombined)
+anova(modelsStudy2$genuinenessCombined)
+
+# Genuineness responses (Identification)
+modelsStudy2$genuinenessCombinedIdentification <- lmer(genuineness ~ group * relations + group * identificationDiffScore_z + 
+                                                         (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$genuinenessCombinedIdentification)
+anova(modelsStudy2$genuinenessCombined, modelsStudy2$genuinenessCombinedIdentification)
+
+# Genuineness responses (Game preference)
+modelsStudy2$genuinenessCombinedGamePreference <- 
+  lmer(genuineness ~ group * relations + group * preferenceDiscrimination + (1|participantID) + (1|imageEmotional),
+                                     data = subset(Study2_SR_T, Study2_SR_T$attentionCheckTeam == "Correct" &
+                                                     Study2_SR_T$attentionCheckGame == "Correct"))
+
+anova(modelsStudy2$genuinenessCombinedGamePreference)
+anova(modelsStudy2$genuinenessCombined, modelsStudy2$genuinenessCombinedGamePreference)
+```
