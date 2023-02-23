@@ -1,0 +1,1213 @@
+---
+title: "Experiment 3 - Eye-tracking, physiological & behavioural data (Cleaning & pre-processing)"
+output: html_document
+date: '2023-02-23'
+---
+
+#### Install rdhf5 
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = "3.14")
+BiocManager::install("rhdf5")
+```
+
+#### Install gazer
+
+```{r}
+remotes::install_github("dmirman/gazer")
+```
+
+#### Install gazepath
+
+```{r}
+install.packages("gazepath")
+library(gazepath)
+```
+
+#### Load other relevant packages
+
+```{r}
+library(afex)
+library(car)
+library(data.table)
+library(DescTools)
+library(dplyr)
+library(emmeans)
+library(eigenmodel)
+library(ggplot2)
+library(Hmisc)
+library(janitor)
+library(lmerTest)
+library(lme4) 
+library(lsmeans)
+library(maditr)
+library(MPsychoR)
+library(openxlsx)
+library(patchwork)
+library(ppcor)
+library(purrr)
+library(qgraph)
+library(readr)
+library(readxl)
+library(rmcorr)
+library(rhdf5)
+library(Routliers)
+library(simr)
+library(stringi)
+library(tidyr)
+library(tidyverse) 
+library(zoo)
+
+# Define functions & remove scientific notation
+`%notin%` <- Negate(`%in%`)
+options(scipen = 999)
+```
+
+### EYE-TRACKING
+
+#### CLEANING FILES
+
+Input: Path to the folder where the raw eye-tracking files are, path to the folder where you want to save clean eye-tracking files
+Output: Clean files with messages parsed and unnecessary columns deleted
+
+```{r}
+# Directory where the raw files are
+# rawData <- ""
+
+# Directory to save the data in
+# saveData <- ""
+
+# Directory to save the calibration data in
+# saveCali <- ""
+
+# Define the function 
+dataCleaningET <- function(rawFilesPath, cleanFilesPath, cleanCaliPath) {
+
+  # Make a list of files 
+  hdfFilesList = list.files(rawFilesPath, pattern = "\\.hdf5$", full.names = TRUE)
+
+  # Check if there are any files in your directory
+  if (length(hdfFilesList) == 0) {
+    
+    return(message('No HDF5 files found in the directory provided.'))
+    
+  }
+
+  # For each of the files, go through the steps below
+  for (f in 1:length(hdfFilesList)) {
+    
+    message(sprintf("Extracting file %i / %i - %s", f, length(hdfFilesList), hdfFilesList[f]))
+
+    # tmp.events - This sub-file contains eye-tracking messages 
+    tmp.events = h5read(hdfFilesList[f], '/data_collection/events/experiment/MessageEvent')
+
+    # tmp.eyetr - This sub-file contains raw eye-tracking data
+    tmp.eyetr  = h5read(hdfFilesList[f], '/data_collection/events/eyetracker/BinocularEyeSampleEvent')
+
+    # Subset subject id , date, and session id 
+    ssid = sapply(strsplit(grep('SubjectID', tmp.events$text, value = TRUE), split = ": "), "[", 2)
+    date = sapply(strsplit(grep('Date', tmp.events$text, value = TRUE), split = ": "), "[", 2)
+    session = sapply(strsplit(grep('Session:', tmp.events$text, value = TRUE), split = ":"), "[", 2)
+    
+    # Subset calibration data
+    cali <- subset(tmp.events, grepl('cali', tmp.events$text) == TRUE)
+    cali$ssid <- ssid
+    cali$session <- session
+
+    # Cleaning
+    cali <- dplyr::select(cali, c("ssid", "session", "text"))
+    
+    cali$validPoints <-
+      if_else(grepl("validPoints", cali$text), sub('.*\\_', '', cali$text), NULL) 
+    
+    cali <- cali %>%
+      fill(validPoints)
+    
+    cali$avgError <-
+      if_else(grepl("avgError", cali$text), sub('.*\\_', '', cali$text), NULL) 
+    
+    cali$numberCali <- unlist(qdapRegex::ex_between(cali$text, "avgError", "_"))
+
+    cali <- na.omit(cali) %>%
+      dplyr::select(-text) 
+
+    rownames(cali) <- NULL
+    
+    # If there are duplicates, run this
+    cali <- cali %>%
+      filter(duplicated(cali$avgError) == FALSE)
+
+    # Transform to numeric
+    cali$numberCali <- as.numeric(cali$numberCali)
+  
+    # Save how many calibrations had to be done
+    for (row in 1:nrow(cali)) {
+      if (row != 1) {
+        cali$numberCali[row] <- cali$numberCali[row] - 1
+      }
+    }
+
+    # Once the calibration data and subject/session information are saved, keep only tStart/tEnd messages
+    phrases = c('tStart', 'tEnd')
+    
+    # Save tStart and tEnd as separate columns
+    tmp.events = subset(tmp.events, grepl(paste(phrases, collapse = "|"), tmp.events$text))
+
+    # Create the columns you will later populate
+    
+    # Column coding the time when a certain event started
+    tmp.events$tStart = NA
+    
+    # Column coding the time when the same event ended
+    tmp.events$tEnd = NA
+    
+    # Trial numbers
+    tmp.events$tNo = NA
+
+    # Go through the events file and grab tStart/tEnd messages
+    for (l in 1:nrow(tmp.events)) {
+      
+      message(sprintf("Grabing message %s", tmp.events$text[l]))
+      
+      if ((grepl('tStart', tmp.events$text[l])) == TRUE) {
+        tmp.events$tStart[l] = tmp.events$time[l]
+        
+        if ((grepl('tEnd', tmp.events$text[l+1])) == TRUE){
+          tmp.events$tEnd[l] = tmp.events$time[l+1]
+        }
+        
+        else {
+          message('Trial start/end structure not valid')
+        }
+      }
+      
+    }
+
+    # Create a column to store what is on the screen
+    # This will need to be adjusted depending on what the screencontent is 
+    tmp.events$Screencontent <- if_else(grepl('rest', tmp.events$text), 'Rest',
+                            if_else(grepl('Practice', tmp.events$text), 'Practice',
+                            if_else(grepl('initialITI', tmp.events$text), 'InitialITI',
+                            if_else(grepl('postCueITI', tmp.events$text), 'PostCueITI',
+                            if_else(grepl('postImageITI', tmp.events$text), 'PostImageITI',
+                            if_else(grepl('finalITI', tmp.events$text), 'FinalITI',
+                            if_else(grepl('fixCross', tmp.events$text), 'FixCross', 
+                            if_else(grepl('Neutral', tmp.events$text), 'NeutralFace', 
+                            if_else(grepl('Emotional', tmp.events$text), 'EmotionalFace',
+                            if_else(grepl('valenceResp', tmp.events$text), 'Valence',
+                            if_else(grepl('arousalResp', tmp.events$text), 'Arousal',
+                            if_else(grepl('genuinenessResp', tmp.events$text), 'Genuineness',
+                            if_else(grepl('approachResp', tmp.events$text), 'Approach',
+                            if_else(grepl('teamResp', tmp.events$text), 'TeamCategorisation',
+                            if_else(grepl('gameResp', tmp.events$text), 'GameCategorisation',
+                            if_else(grepl('Info', tmp.events$text), 'Cue', NULL))))))))))))))))
+    
+
+    # Creating a column to store information about the emotional expression
+    tmp.events$Emotion <- if_else(grepl('Angry', tmp.events$text), 'Angry',
+                          if_else(grepl('Ambiguous', tmp.events$text), 'Ambiguous',
+                          if_else(grepl('Happy', tmp.events$text), 'Happy', NULL))) 
+
+    # Creating a column to store information about the experimental condition (e.g., "ingroup competition")
+     tmp.events$Condition <- 
+      if_else(grepl('restCross', tmp.events$text), 'Rest',
+      if_else(grepl('Ingroup_Cooperation', tmp.events$text), 'Ingroup_Cooperation',
+      if_else(grepl('Outgroup_Cooperation', tmp.events$text), 'Outgroup_Cooperation',
+      if_else(grepl('Outgroup_Competition', tmp.events$text), 'Outgroup_Competition', 
+      if_else(grepl('Ingroup_Competition', tmp.events$text), 'Ingroup_Competition', NULL)))))
+                              
+    # Creating a column to store information about stimuli
+     
+    # Split text into parts based on '_'
+    x <- strsplit(tmp.events$text, "_")
+    
+    # Function to extract n-th element from a list of lists
+    extractElement <- function(lst, n){
+         sapply(lst, `[`, n)
+    }
+    
+    tmp.events$stim_part1 = extractElement(x, c(4))
+    tmp.events$stim_part2 = extractElement(x, c(5))
+    tmp.events$stim_part3 = extractElement(x, c(6))
+    tmp.events$stim_part4 = extractElement(x, c(7))
+
+    # Define the column
+    tmp.events$Stimulus <- paste(tmp.events$stim_part1, tmp.events$stim_part2, tmp.events$stim_part3, tmp.events$stim_part4, sep = "_")
+    
+    # Remove the helper columns
+    tmp.events <- dplyr::select(tmp.events, -c("stim_part1", "stim_part2", "stim_part3", "stim_part4"))
+    tmp.events$Stimulus <- ifelse(tmp.events$Stimulus == "NA_NA_NA_NA", NA, tmp.events$Stimulus)
+
+    # Keep only tStart rows so that you don't have duplicates
+    tmp.events <- subset(tmp.events, grepl('tStart', tmp.events$text))
+    
+    # Keep only rows of interest
+    tmp.events <- tmp.events %>% 
+      filter(Screencontent %in% c('InitialITI', 'Cue', 'PostCueITI', 'FixCross', 'NeutralFace', 'EmotionalFace', 'PostImageITI',
+                                  'Valence', 'Arousal', 'Approach', 'Genuineness', 'FinalITI',
+                                  'TeamCategorisation', 'GameCategorisation'))
+
+    # Fill in the trial numbers
+    # Change this accordingly, depending on which file you are working with!
+    if (session == 1) {
+      tmp.events <- tmp.events %>% mutate(tNo = rep(1:32 , each = 14))
+    } else {
+      tmp.events <- tmp.events %>% mutate(tNo = rep(33:96 , each = 14))
+    }
+
+    # Create an empty dataframe for eye-tracking data
+    tmp.df = data.frame() 
+    
+    for(e in 1:nrow(tmp.events)) {
+
+    # Subset the eye-tracking data based on tStart/tEnd from the messages file
+      tmp.raw.trial <- subset(tmp.eyetr, tmp.eyetr$time >= tmp.events$tStart[e] & tmp.eyetr$time <= tmp.events$tEnd[e])
+      
+      tmp.raw.trial$ssid = ssid
+      tmp.raw.trial$session = session
+      tmp.raw.trial$tNo = tmp.events$tNo[e]
+      tmp.raw.trial$text = tmp.events$text[e]
+      tmp.raw.trial$Stimulus = tmp.events$Stimulus[e]
+      tmp.raw.trial$Emotion = tmp.events$Emotion[e]
+      tmp.raw.trial$Condition = tmp.events$Condition[e]
+      tmp.raw.trial$Screencontent = tmp.events$Screencontent[e]
+      
+      tmp.df = bind_rows(tmp.df, tmp.raw.trial)
+      
+    }
+
+    # Once binded, arange by time
+    tmp.df <- tmp.df %>%
+      arrange(time)
+
+    # Save file
+    name = sprintf("%s_GPdata_%s",ssid, session)
+    write.csv(tmp.df, paste(cleanFilesPath, "/", name,".csv", sep = ''))
+    
+    # Save calibration data separately
+    nameCali = sprintf("%s_GPcali_%s", ssid, session)
+    write.csv(cali, paste(cleanCaliPath, "/", nameCali,".csv", sep = ''))
+    }
+}
+
+# Apply an entire function to clean all files in one go
+dataCleaningET(rawData, saveData, saveCali)
+```
+
+#### PRE-PROCESSING FILES
+
+```{r}
+# LOADING
+
+# Load all files into a single dataframe
+read_plus <- function(flnm) {
+  data.table::fread(flnm, select = c('ssid', "session", "event_id", "time", "left_gaze_x", "left_gaze_y","right_gaze_x", 
+                                     "right_gaze_y","left_pupil_measure1","right_pupil_measure1", "status", 'Condition',	'Screencontent', 
+                                     'Stimulus',	'text',	'Emotion',	'tNo')) %>% 
+    mutate(filename = flnm)
+}
+
+tmp.df2 <-
+  list.files(saveData,
+  pattern = "*.csv", full.names = T) %>% 
+  map_df(~read_plus(.))
+
+# PRE-PROCESSING
+
+# LEFT GAZE VALIDITY
+# Transform invalid gaze into NA values based on validity codes
+# The variable "status" indicates if the eye sample contains valid data. 
+# 0 = Eye sample is OK. 2 = Right eye data is likely invalid. 20 = Left eye data is likely invalid. 22 = Entire eye sample is likely invalid.
+  
+# x
+tmp.df2$left_gaze_x_cor <- if_else(tmp.df2$status != '20', tmp.df2$left_gaze_x, NULL)
+tmp.df2$left_gaze_x_cor <- if_else(tmp.df2$status != '22', tmp.df2$left_gaze_x_cor, NULL)
+
+# y
+tmp.df2$left_gaze_y_cor <- if_else(tmp.df2$status != '20', tmp.df2$left_gaze_y, NULL)
+tmp.df2$left_gaze_y_cor <- if_else(tmp.df2$status != '22', tmp.df2$left_gaze_y_cor, NULL)
+
+# RIGHT GAZE VALIDITY
+
+# x
+tmp.df2$right_gaze_x_cor <- if_else(tmp.df2$status != '2', tmp.df2$right_gaze_x, NULL)
+tmp.df2$right_gaze_x_cor <- if_else(tmp.df2$status != '22', tmp.df2$right_gaze_x_cor, NULL)
+
+# y
+tmp.df2$right_gaze_y_cor <- if_else(tmp.df2$status != '2', tmp.df2$right_gaze_y, NULL)
+tmp.df2$right_gaze_y_cor <- if_else(tmp.df2$status != '22', tmp.df2$right_gaze_y_cor, NULL)
+
+# PUPIL VALIDITY
+
+# Left
+tmp.df2$left_pupil_measure1 <- if_else(tmp.df2$status != '20', tmp.df2$left_pupil_measure1, NULL)
+tmp.df2$left_pupil_measure1 <- if_else(tmp.df2$status != '22', tmp.df2$left_pupil_measure1, NULL)
+
+# Right
+tmp.df2$right_pupil_measure1 <- if_else(tmp.df2$status != '2', tmp.df2$right_pupil_measure1, NULL)
+tmp.df2$right_pupil_measure1 <- if_else(tmp.df2$status != '22', tmp.df2$right_pupil_measure1, NULL)
+
+# REPIXELATION
+
+# Check whether gaze samples are out of bounds and repixelate (e.g., change x coordinates from -960 to 960 range to 0 to 1920 range)
+
+# Cut gaze samples that are off screen 
+tmp.df2$left_gaze_x_cor <- if_else(tmp.df2$left_gaze_x_cor >= -960 & tmp.df2$left_gaze_x_cor <= 960, tmp.df2$left_gaze_x_cor, NULL)
+tmp.df2$right_gaze_x_cor <- if_else(tmp.df2$right_gaze_x_cor >= -960 & tmp.df2$right_gaze_x_cor <= 960, tmp.df2$right_gaze_x_cor, NULL)
+
+tmp.df2$left_gaze_y_cor <- if_else(tmp.df2$left_gaze_y_cor >= -540 & tmp.df2$left_gaze_y_cor <= 540, tmp.df2$left_gaze_y_cor, NULL)
+tmp.df2$right_gaze_y_cor <- if_else(tmp.df2$right_gaze_y_cor >= -540 & tmp.df2$right_gaze_y_cor <= 540, tmp.df2$right_gaze_y_cor, NULL)
+
+# Ensure that the gaze coordinates go from 0 (left) to 1920 (right) on the x-axis and from 0 (down) to 1080 (up) on the y-axis
+tmp.df2$left_gaze_x_cor_pix <- tmp.df2$left_gaze_x_cor + 960
+tmp.df2$right_gaze_x_cor_pix <- tmp.df2$right_gaze_x_cor + 960
+
+tmp.df2$left_gaze_y_cor_pix <- tmp.df2$left_gaze_y_cor + 540
+tmp.df2$right_gaze_y_cor_pix <- tmp.df2$right_gaze_y_cor + 540
+  
+# Check if there are missing values for one or both eyes
+tmp.df2$left_na <- is.na(tmp.df2$left_gaze_x_cor) 
+tmp.df2$right_na <- is.na(tmp.df2$right_gaze_x_cor)
+tmp.df2$both_na <- if_else(tmp.df2$left_na == TRUE & tmp.df2$right_na == TRUE, TRUE, FALSE)
+
+# SINGLE GAZE COORDINATES
+tmp.df2$gaze_x_cor <- 
+    if_else(tmp.df2$left_na == TRUE & tmp.df2$both_na == FALSE, tmp.df2$right_gaze_x_cor,
+    if_else(tmp.df2$right_na == TRUE & tmp.df2$both_na == FALSE, tmp.df2$left_gaze_x_cor,
+     ((tmp.df2$left_gaze_x_cor + tmp.df2$right_gaze_x_cor) / 2)))
+  
+tmp.df2$gaze_y_cor <-
+  if_else(tmp.df2$left_na == TRUE & tmp.df2$both_na == FALSE, tmp.df2$right_gaze_y_cor,
+  if_else(tmp.df2$right_na == TRUE & tmp.df2$both_na == FALSE, tmp.df2$left_gaze_y_cor,
+   ((tmp.df2$left_gaze_y_cor + tmp.df2$right_gaze_y_cor) / 2)))
+
+tmp.df2$gaze_x_cor_pix <- tmp.df2$gaze_x_cor + 960
+
+# Sanity checks (x-axis)
+# min(tmp.df2$gaze_x_cor_pix, na.rm = TRUE)
+# max(tmp.df2$gaze_x_cor_pix, na.rm = TRUE)
+
+tmp.df2$gaze_y_cor_pix <- tmp.df2$gaze_y_cor + 540
+
+# Sanity checks (y-axis)
+# min(tmp.df2$gaze_y_cor_pix, na.rm = TRUE)
+# max(tmp.df2$gaze_y_cor_pix, na.rm = TRUE)
+  
+# CLEAN PUPIL DATA
+# table(tmp.df2$left_na)
+# table(tmp.df2$right_na)
+
+tmp.df2$pupil <- 
+    ifelse(tmp.df2$left_na == TRUE & tmp.df2$right_na == TRUE, NA, 
+           ifelse(tmp.df2$left_na == TRUE & tmp.df2$right_na == FALSE, 
+                    tmp.df2$right_pupil_measure1,
+                    ifelse(tmp.df2$right_na == TRUE & tmp.df2$left_na == FALSE,
+                            tmp.df2$left_pupil_measure1,
+                            ((tmp.df2$left_pupil_measure1 + tmp.df2$right_pupil_measure1) / 
+                               2))))
+
+# MISCELLANEOUS CLEANING STEPS
+
+# Variable which will code precisely every unique section of each trial for each participant
+tmp.df2$trialUnq <- paste(tmp.df2$tNo, paste(tmp.df2$Screencontent, paste(tmp.df2$Stimulus)))
+  
+# Merge data on participants' distance from the screen
+# fileScreenDistance <- ""
+screenDistance <- read_xlsx(fileScreenDistance)
+tmp.df2 <- left_join(tmp.df2, screenDistance, by = c("ssid", "session"))
+
+# Arrange the time
+tmp.df2 <- tmp.df2 %>%
+    group_by(ssid, session) %>%
+    arrange(time)
+
+# Switch to a new dataframe so it's easier to go back if you make a mistake
+tmp.df3 <- tmp.df2
+
+# Split the variable "Condition" into "Group" and "Competition"
+tmp.df3$Group <- ifelse(tmp.df3$Condition %in% c('Outgroup_Cooperation', 'Outgroup_Competition'), 'Outgroup',
+                 ifelse(tmp.df3$Condition %in% c('Ingroup_Cooperation', 'Ingroup_Competition'), 'Ingroup', 'Mistake'))
+
+tmp.df3$Competition <- ifelse(tmp.df3$Condition %in% c('Ingroup_Competition', 'Outgroup_Competition'), 'Competition',
+                 ifelse(tmp.df3$Condition %in% c('Ingroup_Cooperation', 'Outgroup_Cooperation'), 'Cooperation', 'Mistake'))
+
+# REZEROING (Making sure time starts at 0 for each section of each trial)
+
+# Create "firstStart" variable to mark each section of the trial
+tmp.df3 <- tmp.df3 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid) %>%
+  mutate(firstStart = duplicated(trialUnq))
+
+# Create "zero" variable to mark the time each section started
+tmp.df3$zero <- if_else(tmp.df3$firstStart == FALSE, tmp.df3$time, NULL)
+
+# Fill in the starting time for each segment
+tmp.df3 <- tmp.df3 %>%
+  group_by(ssid, session, tNo, Screencontent) %>%
+  fill(zero)
+
+# Rezero
+tmp.df3 <- tmp.df3 %>%
+  arrange(ssid, tNo, time) %>%
+  mutate(timerezeroUnq = time - zero)
+
+# Create a new time variable where time values will be negative prior to participants seeing the emotional face
+# Negative values are extremely useful for baseline correcting pupil size later!
+tmp.df3$zeroEmFace <- if_else(tmp.df3$firstStart == FALSE & tmp.df3$Screencontent == 'EmotionalFace', tmp.df3$time, NULL)
+
+# Fill up zeroEmFace
+tmp.df3 <- tmp.df3 %>%
+      arrange(ssid, tNo, time) %>%
+      group_by(ssid, tNo) %>%
+      fill(zeroEmFace)
+
+# Fill up zeroEmFace to the previous tNo
+tmp.df3 <- tmp.df3 %>%
+      arrange(ssid, tNo, time) %>%
+      group_by(ssid, tNo) %>%
+      fill(zeroEmFace, .direction = c('up'))
+
+# Create a variable "timerezeroNegEmFace" where the value of time is negative before the emotional face appears on the screen
+tmp.df3$timerezeroNegEmFace <- tmp.df3$time - tmp.df3$zeroEmFace
+
+# Create a new time variable where time values will be negative prior to participants seeing the cue
+tmp.df3$zeroCue <- if_else(tmp.df3$firstStart == FALSE & tmp.df3$Screencontent == 'Cue', tmp.df3$time, NULL)
+
+# Fill up zeroCue
+tmp.df3 <- tmp.df3 %>%
+      arrange(ssid, tNo, time) %>%
+      group_by(ssid, tNo) %>%
+      fill(zeroCue)
+
+# Fill up zeroCue to the previous tNo
+tmp.df3 <- tmp.df3 %>%
+      arrange(ssid, tNo, time) %>%
+      group_by(ssid, tNo) %>%
+      fill(zeroCue, .direction = c('up'))
+
+# Create a variable "timerezeroNegCue" where the value of time is negative before the cue appears on the screen
+tmp.df3$timerezeroNegCue <- tmp.df3$time - tmp.df3$zeroCue
+
+# Indicate when the new session starts (if the value is FALSE, that means you are looking at the first trial of each session)
+tmp.df3 <- tmp.df3 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid, session) %>%
+  mutate(duplicatedSession = duplicated(session))
+
+# CLEANING PUPIL DATA 
+
+# Step 1: Define min and max values for pupil (+/- 3 SD from the average pupil size for each person)
+tmp.df3 <- tmp.df3 %>%
+  dplyr::group_by(ssid) %>%
+  dplyr::mutate(pupilMin = mean(pupil, na.rm = TRUE) - 3 * sd(pupil,  na.rm = TRUE)) %>%
+  dplyr::mutate(pupilMax = mean(pupil,  na.rm = TRUE) + 3 * sd(pupil,  na.rm = TRUE))
+
+tmp.df3$pupil <- if_else(tmp.df3$pupil > tmp.df3$pupilMin, tmp.df3$pupil, NULL) 
+tmp.df3$pupil <- if_else(tmp.df3$pupil < tmp.df3$pupilMax, tmp.df3$pupil, NULL)
+
+# Step 2: De-blinking / smoothing / interpolation
+tmp.df3$subject <- tmp.df3$ssid
+tmp.df3$trial <- tmp.df3$trialUnq 
+tmp.df3 <- tmp.df3 %>%
+  arrange(ssid, tNo, time)
+
+# Basically, this will extend NAs around invalid gaze samples by 125 ms (you can change this value below)
+# fillback = NA extend backward (in ms)
+# fillforward = NA extend forward (in ms)
+tmp.df3 <- tmp.df3 %>%
+  group_by(ssid, session, tNo) %>%
+  mutate(extendpupil = gazer::extend_blinks(pupil, fillback = 125, fillforward = 125, hz = 150))
+
+# Smoothing & interpolation
+tmp.df4 <- 
+  gazer::smooth_interpolate_pupil(tmp.df3, pupil = "pupil", extendpupil = extendpupil,
+                                    extendblinks = TRUE, step.first = 'smooth',
+                                    maxgap = 75, 
+                                    filter = 'moving',
+                                    type = "linear", hz = 150, n = 5)
+
+# Calculate speed of pupil change
+tmp.df4 <- tmp.df4 %>%
+  dplyr::group_by(subject, trial) %>%
+  dplyr::mutate(speed = gazer::speed_pupil(pup_interp, time), na.rm = TRUE) %>%
+  dplyr::mutate(MAD = gazer::calc_mad(speed),na.rm = TRUE)
+
+# Remove samples where the pupil size rapidly increases or decreases
+tmp.df4$pup_interp_mad <- if_else(tmp.df4$speed < tmp.df4$MAD, tmp.df4$pup_interp, NULL)
+
+tmp.df4 <- tmp.df4 %>%
+  group_by(ssid, session, tNo) %>%
+  mutate(pup_interp_mad_extend = gazer::extend_blinks(pup_interp_mad, fillback = 25, fillforward = 25, hz = 150))
+
+# Step 3: Subtractive baseline correction 
+
+# Count the samples in each trial section
+tmp.df4 <- tmp.df4 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid, trialUnq) %>%
+  mutate(sample = 1:n())
+
+tmp.df4 <- tmp.df4 %>%
+  group_by(ssid, trialUnq) %>%
+  mutate(maxSample = max(sample))
+
+# Sample difference - Variable that is counting samples in reverse
+tmp.df4$sampleDiff <- tmp.df4$maxSample - tmp.df4$sample
+                                            
+# The last 20 samples from the previous trial, and the first 20 samples from the current trial constitute a baseline period
+tmp.df4$pup_bas <- if_else(tmp.df4$sample < 21, tmp.df4$pup_interp_mad_extend,
+                   if_else(tmp.df4$sampleDiff < 20, tmp.df4$pup_interp_mad_extend, NULL))
+
+tmp.df4$pup_bastrue <- if_else(tmp.df4$sample < 21, TRUE,
+                       if_else(tmp.df4$sampleDiff < 20, TRUE, FALSE))
+
+# Push these values down 20 steps so that all the samples needed to compute the median will always fall within the trial where they will be used
+tmp.df4$pup_bas_forward <- lag(tmp.df4$pup_bas, 20)
+tmp.df4$pup_bas_boolean <- if_else(is.na(tmp.df4$pup_bas_forward), TRUE, FALSE)
+
+# Create the median pupil size
+tmp.df4 <- tmp.df4 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid, trialUnq, pup_bas_boolean) %>%
+  mutate(pup_bas_med = median(pup_bas_forward, na.rm = TRUE))
+
+tmp.df4 <- tmp.df4 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid, trialUnq) %>%
+  fill(pup_bas_med, .direction = 'downup')
+
+# Subtract pupil size from median pupil size during the baseline period
+tmp.df4 <- tmp.df4 %>%
+  arrange(ssid, tNo, time) %>%
+  group_by(ssid, trialUnq) %>%
+  mutate(pup_basCor = pup_interp_mad - pup_bas_med)
+
+eyeTrackingPupil <- tmp.df4
+```  
+
+#### GAZEPATH
+
+```{r}
+# Calculate trackloss
+eyeTrackingPupil$trackloss <- if_else(eyeTrackingPupil$status > 0, 1, 0)
+
+eyeTrackingPupil <- eyeTrackingPupil %>%
+  arrange(participantID, tNo, time)
+
+eyeTrackingPupil <- eyeTrackingPupil %>%
+  group_by(participantID, tNo, trialUnq, text) %>%
+  mutate(gaze_loss_prop = sum(trackloss)/n()) %>%
+  mutate(gaze_valid_prop = 1 - gaze_loss_prop)
+
+# Have a time column that will start at 0 for the neutral face
+eyeTrackingPupil$zeroNeuFace <- if_else(eyeTrackingPupil$firstStart == FALSE & 
+                                                eyeTrackingPupil$screencontent == 'NeutralFace', eyeTrackingPupil$time,
+                                                NULL)
+
+# Fill up zeroNeuFace
+eyeTrackingPupil <- eyeTrackingPupil %>%
+      arrange(participantID, tNo, time) %>%
+      group_by(participantID, tNo) %>%
+      fill(zeroNeuFace)
+
+# Fill up zeroNeuFace to the previous tNo
+eyeTrackingPupil <- eyeTrackingPupil %>%
+      arrange(participantID, tNo, time) %>%
+      group_by(participantID, tNo) %>%
+      fill(zeroNeuFace, .direction = c('up'))
+
+# Create a variable "timerezeroNegNeuFace" where the value of time is negative before the neutral face appears on the screen
+eyeTrackingPupil$timerezeroNegNeuFace <- eyeTrackingPupil$time - eyeTrackingPupil$zeroNeuFace
+
+# CREATE A DATAFRAME FOR GAZEPATH
+for_gazepath <- eyeTrackingPupil %>%
+  filter(screencontentEm == "EmotionalFace")
+
+# Change "Neutral" in the text column 
+# Change "NE.png" in the text column
+for_gazepath$textClean <-   
+  ifelse(str_detect(for_gazepath$text, '_NE.png') & for_gazepath$emotion == "Happy",
+          gsub("_NE.png", "_HA.png", for_gazepath$text), 
+  ifelse(str_detect(for_gazepath$text, '_NE.png') & for_gazepath$emotion == "Ambiguous",
+          gsub("_NE.png", "_AM.png", for_gazepath$text), 
+  ifelse(str_detect(for_gazepath$text, '_NE.png') & for_gazepath$emotion == "Angry",
+         gsub("_NE.png", "_AN.png", for_gazepath$text), for_gazepath$text)))
+
+for_gazepath$textClean <- ifelse(str_detect(for_gazepath$textClean, 'Neutral'), gsub("Neutral", "Emotional", for_gazepath$textClean), for_gazepath$textClean)
+
+for_gazepath$textClean <- sub("_[^_]+$", "", for_gazepath$textClean)
+for_gazepath$textClean <- paste0(for_gazepath$textClean,"_",for_gazepath$tNo)
+
+# Remove ERTpartX
+for_gazepath$textClean <- 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTpart1'),
+          gsub("_ERTpart1", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTpart2'),
+          gsub("_ERTpart2", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTpart3'),
+         gsub("_ERTpart3", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTpart4'),
+         gsub("_ERTpart4", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTPart1'),
+          gsub("_ERTPart1", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTPart2'),
+          gsub("_ERTPart2", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTPart3'),
+         gsub("_ERTPart3", "", for_gazepath$textClean), 
+  ifelse(str_detect(for_gazepath$textClean, '_ERTPart4'), 
+        gsub("_ERTPart4", "", for_gazepath$textClean), for_gazepath$textClean))))))))
+
+# Transform screen distance from cm into mm
+for_gazepath$screenDistanceMM <- for_gazepath$screenDistance * 10
+
+for_gazepath <- dplyr::select(for_gazepath, 
+                              c(participantID, event_id, session, event_id,	textClean,	trialUnq,	tNo, condition,	screencontentEm, emotion, group, 
+                                combination, stimulusCorrected,	time, timerezeroNegNeuFace, status, filename, left_gaze_x_cor_pix,	
+                                right_gaze_x_cor_pix,	left_gaze_y_cor_pix, right_gaze_y_cor_pix,	gaze_x_cor_pix,	gaze_y_cor_pix,	pupil, 
+                                screenDistanceMM, trackloss))
+
+for_gazepath <- for_gazepath %>%
+    arrange(participantID, tNo, timerezeroNegNeuFace)
+
+for_gazepath$split_column <- paste0(for_gazepath$participantID, "_", for_gazepath$combination)
+
+split_df <- split(for_gazepath, list(for_gazepath$split_column))
+
+for (splitcol in names(split_df)) {
+  write_csv(split_df[[splitcol]], paste0('gp_',paste0(splitcol),".csv"))
+}
+
+# Make sure to use an older version of R to run GazePath GUI
+GUI()
+```
+
+#### CLEANING GAZEPATH FILE & CONSTRUCTING AREAS OF INTEREST
+
+```{r}
+# gazePathFile <- ""
+gazePathFiles <- read.csv(gazePathFile)
+
+# Reconstruct important variables
+extractElement <- function(lst, n){
+     sapply(lst, `[`, n)
+}
+
+# Participant ID
+participants <- strsplit(gazePathFiles$Participant, "_")
+gazePathFiles$participantID <- extractElement(participants, c(2))
+
+# Group
+gazePathFiles$Group <- 
+  if_else(grepl("Ingroup", gazePathFiles$texttNo), "Ingroup", "Outgroup")
+
+# Competition
+gazePathFiles$Competition <- 
+  if_else(grepl("Competition", gazePathFiles$texttNo), "Competition", "Cooperation")
+
+# Emotion
+gazePathFiles$Emotion <- 
+  if_else(grepl("Happy", gazePathFiles$texttNo), "Happy",
+  if_else(grepl("Angry", gazePathFiles$texttNo),"Angry", "Ambiguous"))
+
+# Stimulus
+x <- strsplit(gazePathFiles$texttNo, "_")
+
+gazePathFiles$stim_part1 = extractElement(x, c(4))
+gazePathFiles$stim_part2 = extractElement(x, c(5))
+gazePathFiles$stim_part3 = extractElement(x, c(6))
+gazePathFiles$stim_part4 = extractElement(x, c(7))
+
+gazePathFiles$Stimulus <- paste(gazePathFiles$stim_part1, gazePathFiles$stim_part2, gazePathFiles$stim_part3, gazePathFiles$stim_part4, sep = "_")
+
+# Remove the helper columns
+gazePathFiles<- dplyr::select(gazePathFiles, -c("stim_part1", "stim_part2", "stim_part3", "stim_part4"))
+
+# Fix _NE.png in gazePath file 
+gazePathFiles$StimulusCorrected <-
+  ifelse(str_detect(gazePathFiles$Stimulus, '_NE.png') & gazePathFiles$Emotion == "Happy",
+          gsub("_NE.png", "_HA.png", gazePathFiles$Stimulus), 
+  ifelse(str_detect(gazePathFiles$Stimulus, '_NE.png') & gazePathFiles$Emotion == "Ambiguous",
+          gsub("_NE.png", "_AM.png", gazePathFiles$Stimulus), 
+  ifelse(str_detect(gazePathFiles$Stimulus, '_NE.png') & gazePathFiles$Emotion == "Angry",
+         gsub("_NE.png", "_AN.png", gazePathFiles$Stimulus), gazePathFiles$Stimulus)))
+
+# Trial number
+gazePathFiles2020 <- gazePathFiles %>%
+  filter(participantID %in% c(101, 102, 103, 105, 110, 113, 114, 115, 119))
+
+gazePathFiles2022 <- gazePathFiles %>%
+  filter(participantID %notin% c(101, 102, 103, 105, 110, 113, 114, 115, 119))
+
+# 2020
+gazePathFiles2020$EmotionalImage <- gazePathFiles2020$StimulusCorrected
+
+versions2020tNo <- versions2020 %>%
+  dplyr::select(c("participantID", "tNo", "EmotionalImage"))
+
+gazePathFiles2020 <- left_join(gazePathFiles2020, versions2020tNo, by = c("participantID", "EmotionalImage"))
+gazePathFiles2020$EmotionalImage <- NULL
+
+# 2022
+gazePathFiles2022$tNo <- as.numeric(as.character(gsub(".*_","",gazePathFiles2022$texttNo)))
+
+# Merge
+gazePathFiles<- rbind(gazePathFiles2020, gazePathFiles2022)
+
+# Arrange
+gazePathFiles<- gazePathFiles%>%
+  arrange(participantID, tNo)
+
+# Areas of interest
+# openFaceFile <- ""
+openFaceCoordinates <- read.csv(openFaceFile)
+
+openFaceCoordinates$noseX <- openFaceCoordinates$x_33
+openFaceCoordinates$noseY <- openFaceCoordinates$y_33
+
+openFaceCoordinates$leftEyeX <- (openFaceCoordinates$x_36 + openFaceCoordinates$x_39) / 2
+openFaceCoordinates$leftEyeY <- (openFaceCoordinates$y_38 + openFaceCoordinates$y_40) / 2
+
+openFaceCoordinates$rightEyeX <- (openFaceCoordinates$x_42 + openFaceCoordinates$x_45) / 2
+openFaceCoordinates$rightEyeY <- (openFaceCoordinates$y_44 + openFaceCoordinates$y_46) / 2
+
+openFaceCoordinates$mouthX <- (openFaceCoordinates$x_60 + openFaceCoordinates$x_64) / 2
+openFaceCoordinates$mouthY <- (openFaceCoordinates$y_62 + openFaceCoordinates$y_66) / 2
+
+openFaceCoordinatesMain <- dplyr::select(openFaceCoordinates, c("face", "noseX", "noseY", "leftEyeX", "leftEyeY", "rightEyeX", 
+                                                                "rightEyeY", "mouthX", "mouthY"))
+
+openFaceCoordinatesMain$noseY_cor <- 1080 - openFaceCoordinatesMain$noseY
+openFaceCoordinatesMain$leftEyeY_cor <- 1080 - openFaceCoordinatesMain$leftEyeY
+openFaceCoordinatesMain$rightEyeY_cor <- 1080 - openFaceCoordinatesMain$rightEyeY
+openFaceCoordinatesMain$mouthY_cor <- 1080 - openFaceCoordinatesMain$mouthY
+
+openFaceCoordinatesMain <- dplyr::select(openFaceCoordinatesMain, c("face", "noseX", "noseY_cor", "leftEyeX", "leftEyeY_cor", "rightEyeX", 
+                                                                "rightEyeY_cor", "mouthX", "mouthY_cor"))
+
+names(openFaceCoordinatesMain)[1] <- "StimulusCorrected"
+openFaceCoordinatesMain$StimulusCorrected <- gsub(".csv", ".png", openFaceCoordinatesMain$StimulusCorrected)
+
+gazePathFiles<- left_join(gazePathFiles, openFaceCoordinatesMain, by = "StimulusCorrected")
+
+# Assigning gaze to AOIs
+
+# Step 1: Calculate Euclidian distances from each area of interest (left eye, right eye, mouth, nose)
+gazePathFiles$eucl_dist_eye_left <- sqrt(((gazePathFiles$leftEyeX - gazePathFiles$mean_x) ^ 2) + ((gazePathFiles$leftEyeY_cor - gazePathFiles$mean_y) ^ 2))
+
+gazePathFiles$eucl_dist_eye_right <- sqrt(((gazePathFiles$rightEyeX - gazePathFiles$mean_x) ^ 2) + ((gazePathFiles$rightEyeY_cor - gazePathFiles$mean_y) ^ 2)) 
+
+gazePathFiles$eucl_dist_nose <- sqrt(((gazePathFiles$noseX - gazePathFiles$mean_x) ^ 2) + ((gazePathFiles$noseY_cor - gazePathFiles$mean_y) ^ 2))
+
+gazePathFiles$eucl_dist_mouth <- sqrt(((gazePathFiles$mouthX - gazePathFiles$mean_x) ^ 2) + ((gazePathFiles$mouthY_cor - gazePathFiles$mean_y) ^ 2))
+
+# Step 2: Calculate the distance from each to each AOI for each image (The distance between two eyes is irrelevant)
+gazePathFiles$nose_left_eye <- sqrt(((gazePathFiles$leftEyeX - gazePathFiles$noseX) ^ 2) + ((gazePathFiles$leftEyeY_cor - gazePathFiles$noseY_cor) ^ 2))
+
+gazePathFiles$nose_right_eye <- sqrt(((gazePathFiles$rightEyeX - gazePathFiles$noseX) ^ 2) + ((gazePathFiles$rightEyeY_cor - gazePathFiles$noseY_cor) ^ 2)) 
+
+gazePathFiles$nose_mouth <- sqrt(((gazePathFiles$mouthX - gazePathFiles$noseX) ^ 2) + ((gazePathFiles$mouthY_cor - gazePathFiles$noseY_cor) ^ 2))
+
+gazePathFiles$mouth_left_eye <- sqrt(((gazePathFiles$mouthX - gazePathFiles$leftEyeX) ^ 2) + ((gazePathFiles$mouthY_cor - gazePathFiles$leftEyeY_cor) ^ 2))
+
+gazePathFiles$mouth_right_eye <- sqrt(((gazePathFiles$mouthX - gazePathFiles$rightEyeX) ^ 2) + ((gazePathFiles$mouthY_cor - gazePathFiles$rightEyeY_cor) ^ 2))
+
+# Step 3: Assign gaze to AOIs based just on minimum value
+gazePathFiles$minDistance <- with(gazePathFiles, pmin(eucl_dist_eye_left, eucl_dist_eye_right, eucl_dist_nose, eucl_dist_mouth))
+
+gazePathFiles$AOI <- 
+  ifelse(gazePathFiles$minDistance == gazePathFiles$eucl_dist_eye_left, "Eyes",
+  ifelse(gazePathFiles$minDistance == gazePathFiles$eucl_dist_eye_right, "Eyes",
+  ifelse(gazePathFiles$minDistance == gazePathFiles$eucl_dist_nose, "Nose", "Mouth")))
+
+# Since you are focusing on fixations, give NA values for saccades
+gazePathFiles$AOI <-
+  ifelse(gazePathFiles$Value == "s", NA, gazePathFiles$AOI)
+
+# Step 4: Change AOI value to "Couldn't be determined" if the minDistance value is == or greater than the value(s) that reflect the distance between two adjacent AOIs (e.g., eyes and nose, nose and mouth)
+gazePathFiles$minDistanceAOI <- with(gazePathFiles, pmin(nose_left_eye, nose_right_eye, nose_mouth, mouth_left_eye, mouth_right_eye))
+
+gazePathFiles$AOICorrected <-
+  ifelse(gazePathFiles$AOI == "Nose" &
+           gazePathFiles$minDistance < gazePathFiles$nose_left_eye &
+           gazePathFiles$minDistance < gazePathFiles$nose_right_eye &
+           gazePathFiles$minDistance < gazePathFiles$nose_mouth, "Nose",
+  ifelse(gazePathFiles$AOI == "Mouth" &
+           gazePathFiles$minDistance < gazePathFiles$nose_mouth, "Mouth",
+  ifelse(gazePathFiles$AOI == "Eyes" &
+           gazePathFiles$minDistance < gazePathFiles$nose_left_eye &
+           gazePathFiles$minDistance < gazePathFiles$nose_right_eye, "Eyes", NA)))
+
+gazePathFiles$AOICorrected2 <-
+  ifelse(gazePathFiles$minDistance < gazePathFiles$minDistanceAOI, gazePathFiles$AOI, NA)
+
+# Fix column names
+gazePathFiles$Participant <- NULL
+gazePathFiles$Trial <- NULL
+gazePathFiles$Stimulus <- NULL
+names(gazePathFiles) <- c("fixationSaccade", "duration", "startGazeEvent", "endGazeEvent", "meanX", "meanY", "sdPOGsacAMP", "rootMeanSq", "text", 
+                                  "orderGazeEvent", "participantID", "group", "condition", "emotion", "emotionalImage", "tNo", "noseX", "noseYCor", 
+                                  "leftEyeX", "leftEyeYCor", "rightEyeX", "rightEyeYCor", "mouthX", "mouthYCor", 
+                                  "euclDistLeftEye", "euclDistRightEye", "euclDistNose", "euclDistMouth", "euclDistNoseLeftEye",
+                                 "euclDistNoseRightEye", "euclDistNoseMouth", "euclDistMouthLeftEye", "euclDistMouthRightEye",
+                                 "minDistance", "AOI", "minDistanceAOI", "AOICorrected", "AOICorrected2")
+```
+
+### PHYSIOLOGY (SCR) 
+
+```{r}
+# Loaded to verify triggers
+# triggerFileLocal <- ""
+triggerFile <- read.csv(triggerFileLocal)
+
+# Events
+# eventPath <- ""
+eventsList <- list.files(eventPath, pattern = "*.xlsx", full.names = T) 
+eventsFileNames <- sub('.*\\/', '', eventsList)
+eventsFileNames <- substr(eventsFileNames,1, nchar(eventsFileNames) - 12)
+
+eventsDataFull <- data.frame()
+
+for (f in 1:length(eventsList)) {
+
+  eventsData <- read_excel(eventsList[f])
+  eventsData$participantID <- eventsFileNames[f]
+
+  eventsDataFull <- rbind(eventsDataFull, eventsData)
+
+}
+
+eventsDataFull <- dplyr::select(eventsDataFull, c("participantID", "Index", "Time", "Type", "Label"))
+eventsDataFull <- eventsDataFull %>%
+  filter(Type == "Stimulus Delivery") 
+eventsDataFull$Time <- str_remove(eventsDataFull$Time, " sec")
+eventsDataFull <- dplyr::select(eventsDataFull,  c("participantID", "Index", "Time", "Label"))
+
+# Ledalab
+# ledalabPath <- ""
+ledalabList <- list.files(ledalabPath, pattern = "*.xlsx", full.names = T) 
+ledalabFileNames <- sub('.*\\/', '', ledalabList)
+ledalabFileNames <- substr(ledalabFileNames,1, nchar(ledalabFileNames) - 14)
+
+ledalabDataFull <- data.frame()
+
+for (f in 1:length(ledalabList)) {
+
+  ledalabData <- read_excel(ledalabList[f])
+  ledalabData$participantID <- ledalabFileNames[f]
+  
+  ledalabDataFull <- rbind(ledalabDataFull, ledalabData)
+
+}
+
+# Combine events & ledalab files
+names(ledalabDataFull)[1] <- "Index"
+eventsLedalab <- left_join(eventsDataFull, ledalabDataFull, by = c("participantID", "Index"))
+
+# Dealing with Acq artifacts (e.g., it sends random triggers that were not specified by PsychoPy)
+eventsLedalab$screencontentPhysio <- 
+  if_else(eventsLedalab$Label == "4", "cue",
+  if_else(eventsLedalab$Label == "103", "teamResponse",
+  if_else(eventsLedalab$Label == "105", "gameResponse",
+  if_else(eventsLedalab$Label == "5", "fixCross",
+  if_else(eventsLedalab$Label == "6", "neutralFace",
+  if_else(eventsLedalab$Label == "101", "valenceResponse",
+  if_else(eventsLedalab$Label == "102", "arousalResponse",
+  if_else(eventsLedalab$Label == "106", "approachAvoidResponse",
+  if_else(eventsLedalab$Label == "104", "genuinenessResponse", 
+  if_else(eventsLedalab$Label %in% unique(triggerFile$trigger), 'emotionalFace', 'Mistake'))))))))))
+
+eventsLedalab <- eventsLedalab %>%
+  filter(screencontentPhysio != "Mistake")
+
+# Check the sequence of events and flag those that do not follow the sequence
+eventsLedalab$flag <- 
+  ifelse(eventsLedalab$screencontentPhysio == "cue"  & lag(eventsLedalab$screencontentPhysio, 1) == "genuinenessResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "teamResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "teamResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "cue" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "gameResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "gameResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "teamResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "fixCross", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "fixCross"  & lag(eventsLedalab$screencontentPhysio, 1) == "gameResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "neutralFace", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "neutralFace"  & lag(eventsLedalab$screencontentPhysio, 1) == "fixCross" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "emotionalFace", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "emotionalFace"  & lag(eventsLedalab$screencontentPhysio, 1) == "neutralFace" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "valenceResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "valenceResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "emotionalFace" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "arousalResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "arousalResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "valenceResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "approachAvoidResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "approachAvoidResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "arousalResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "genuinenessResponse", "No",
+  ifelse(eventsLedalab$screencontentPhysio == "genuinenessResponse"  & lag(eventsLedalab$screencontentPhysio, 1) == "approachAvoidResponse" &
+           lead(eventsLedalab$screencontentPhysio, 1) == "cue", "No", "Yes"))))))))))
+
+eventsLedalab$flag <- ifelse(is.na(eventsLedalab$flag) == TRUE, 'No', eventsLedalab$flag)
+
+# Add info about the images
+names(eventsLedalab)[4] <- "trigger"
+
+# Behavioural data 
+triggerFile$trigger <- as.character(triggerFile$trigger)
+
+eventsLedalabImg <- left_join(eventsLedalab, triggerFile, by = c("participantID", "trigger"))
+
+eventsLedalabImg <- eventsLedalabImg %>%
+  group_by(participantID, tNo) %>%
+  fill(names(eventsLedalabImg)[23:123], .direction = 'downup')
+```
+
+### BEHAVIOUR
+
+#### CLEANING LAB FILES
+
+```{r}
+# rawFilesBeh <- ""
+
+dataCleaningBeh <- function(rawFilesPath) {
+  
+  # Make a list of files 
+  behFilesList = list.files(rawFilesPath, pattern = "\\.csv$", full.names = TRUE)
+
+  # Check if there are any files in your directory
+  if (length(behFilesList) == 0) {
+    
+    return(message('No csv files found in the directory provided.'))
+    
+  }
+  
+  tmp.df <- data.frame()
+
+  # For each of the files, go through the steps below
+  for (f in 1:length(behFilesList)) {
+    
+    message(sprintf("Cleaning file %i / %i - %s", f, length(behFilesList), behFilesList[f]))
+    
+    participantTemp <- sapply(strsplit(behFilesList[f], "//"), "[", 2)
+    participant <- sapply(strsplit(participantTemp, "_"), "[", 1)
+  
+    if (grepl("ERTPart1", behFilesList[f]) == TRUE) {
+      
+      tmp.file <- read.csv(behFilesList[f]) 
+      
+      tmp.filePart1 <- dplyr::select(tmp.file, c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender",
+                                            "trigger", "Combination", "FixCoord", "ImageInfo", 
+                                            "mouseTeamPart1.time", "mouseTeamPart1.clicked_name", "correctTeamPart1", 
+                                            "mouseGamePart1.time", "mouseGamePart1.clicked_name", "correctGamePart1", 
+                                            "ratingValencePart1.response", "ratingValencePart1.rt",
+                                            "ratingArousalPart1.response", "ratingArousalPart1.rt",
+                                            "approachAvoidChoicePart1.time", "approachAvoidChoicePart1.clicked_name", "approachAvoidPart1",
+                                            "ratingGenuinenessPart1.response", "ratingGenuinenessPart1.rt"))
+      
+      tmp.filePart1 <- tmp.filePart1 %>%
+        filter(is.na(ratingValencePart1.response) == FALSE)
+      
+      tmp.filePart1$participant <- participant
+      tmp.filePart1$session <- 1
+      
+      names(tmp.filePart1) <- c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender", "trigger", "Combination", 
+                           "FixCoord", "ImageInfo", "mouseTeamRT", "mouseTeamResponse", "correctTeam", "mouseGameRT", "mouseGameResponse", 
+                           "correctGame", "ratingValence", "ratingValenceRT", "ratingArousal", "ratingArousalRT", 
+                           "approachAvoidRT", "approachAvoidResponseRemove", "approachAvoidResponse",
+                           "ratingGenuineness", "ratingGenuinenessRT", "participantID", "session")
+      
+      tmp.filePart1$tNo <- 1:32
+      
+      tmp.filePart1$approachAvoidResponseRemove <- NULL
+      
+      tmp.df <- rbind(tmp.df, tmp.filePart1)
+
+    } else {
+      
+      tmp.file <- read.csv(behFilesList[f]) 
+      
+      tmp.filePart2 <- dplyr::select(tmp.file, c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender",
+                                            "trigger", "Combination", "FixCoord", "ImageInfo", 
+                                            "mouseTeamPart2.time", "mouseTeamPart2.clicked_name", "correctTeamPart2", 
+                                            "mouseGamePart2.time", "mouseGamePart2.clicked_name", "correctGamePart2", 
+                                            "ratingValencePart2.response", "ratingValencePart2.rt",
+                                            "ratingArousalPart2.response", "ratingArousalPart2.rt",
+                                            "approachAvoidChoicePart2.time", "approachAvoidChoicePart2.clicked_name", "approachAvoidPart2",
+                                            "ratingGenuinenessPart2.response", "ratingGenuinenessPart2.rt"))
+      
+      tmp.filePart2 <- tmp.filePart2 %>% filter(is.na(ratingValencePart2.response) == FALSE)
+      
+      tmp.filePart2$participant <- participant
+      tmp.filePart2$session <- 2
+      
+      names(tmp.filePart2) <- c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender", "trigger", 
+                                "Combination", 
+                                "FixCoord", "ImageInfo", "mouseTeamRT", "mouseTeamResponse", "correctTeam", "mouseGameRT", 
+                                "mouseGameResponse", 
+                                "correctGame", "ratingValence", "ratingValenceRT", "ratingArousal", "ratingArousalRT", 
+                                "approachAvoidRT", "approachAvoidResponseRemove", "approachAvoidResponse",
+                                "ratingGenuineness", "ratingGenuinenessRT", "participantID", "session")
+      
+      tmp.filePart2$tNo <- 33:64
+      
+      tmp.filePart2$approachAvoidResponseRemove <- NULL
+      
+      tmp.filePart3 <- dplyr::select(tmp.file, c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender",
+                                      "trigger", "Combination", "FixCoord", "ImageInfo", 
+                                      "mouseTeamPart3.time", "mouseTeamPart3.clicked_name", "correctTeamPart3", 
+                                      "mouseGamePart3.time", "mouseGamePart3.clicked_name", "correctGamePart3", 
+                                      "ratingValencePart3.response", "ratingValencePart3.rt",
+                                      "ratingArousalPart3.response", "ratingArousalPart3.rt",
+                                      "approachAvoidChoicePart3.time", "approachAvoidChoicePart3.clicked_name", "approachAvoidPart3",
+                                      "ratingGenuinenessPart3.response", "ratingGenuinenessPart3.rt"))
+    
+      tmp.filePart3 <- tmp.filePart3 %>% filter(is.na(ratingValencePart3.response) == FALSE)      
+      
+      tmp.filePart3$participant <- participant
+      tmp.filePart3$session <- 3
+      
+      names(tmp.filePart3) <- c("NeutralImage", "EmotionalImage", "Group", "Condition", "Emotion", "Identity", "Gender", "trigger",
+                                "Combination", "FixCoord", "ImageInfo", "mouseTeamRT", "mouseTeamResponse", "correctTeam", "mouseGameRT", 
+                                "mouseGameResponse", 
+                                "correctGame", "ratingValence", "ratingValenceRT", "ratingArousal", "ratingArousalRT", 
+                                "approachAvoidRT", "approachAvoidResponseRemove", "approachAvoidResponse",
+                                "ratingGenuineness", "ratingGenuinenessRT", "participantID", "session")
+      
+      tmp.filePart3$tNo <- 65:96
+      
+      tmp.filePart3$approachAvoidResponseRemove <- NULL
+      
+      tmp.df <- rbind(tmp.df, tmp.filePart2)
+      tmp.df <- rbind(tmp.df, tmp.filePart3)
+      
+    }
+    
+  }
+  
+  tmp.df <- tmp.df %>%
+    arrange(participantID, tNo)
+  
+  tmp.df$mouseTeamResponse <- 
+    if_else(grepl("OwnTeam", tmp.df$mouseTeamResponse), "OwnTeam", "OtherTeam")
+  
+  tmp.df$mouseGameResponse <- 
+    if_else(grepl("Cooperative", tmp.df$mouseGameResponse), "Cooperative", "Competitive")
+  
+  return(tmp.df)
+  
+}
+
+dataBehaviour <- dataCleaningBeh(rawFilesBeh)
+```
+
+#### CLEANING ONLINE (GORILLA EXPERIMENT BUILDER) FILES
+
+```{r}
+# PRE-LAB FILES
+
+# LOAD
+# tempPreLabPath <- ""
+tempPreLab <- list.files(tempPreLabPath, pattern = "*", full.names = TRUE)
+
+namesPreLab <- sub('.*\\/', '', tempPreLab)
+namesPreLab <- substr(namesPreLab, 1, nchar(namesPreLab) - 4)
+
+allPreLab <- lapply(tempPreLab, read.csv)
+names(allPreLab) <- namesPreLab
+
+list2env(allPreLab, envir = .GlobalEnv)
+
+# CLEAN
+das <- rbind(dasVers10, dasVers11, dasVers12, dasVers13, dasVers14)
+
+tas <- rbind(tasVers10, tasVers11, tasVers12, tasVers13, tasVers14)
+
+demo <- rbind(demographicsVers10, demographicsVers11, demographicsVers12, demographicsVers13, demographicsVers14)
+
+gameChoice <- rbind(gameChoiceIGVers11, gameChoiceIGVers12, gameChoiceIGVers14, gameChoiceOGVers11, gameChoiceOGVers13, gameChoiceOGVers14, gameChoicesIGVers10, gameChoicesOGVers10)
+
+gameChoiceShort <- select(gameChoice, c(Participant.Public.ID, display, Response, Zone.Name, Zone.Type))
+
+gameChoiceShort <- gameChoiceShort %>%
+  filter(Zone.Type %in% c("response_button_text", "response_text_area"))
+
+gameChoiceShort$ResponseType <- if_else(gameChoiceShort$Zone.Name %in% c("IGChoiceRedReason", "IGChoiceBlueReason"), "ingroupChoiceReason",
+                                if_else(gameChoiceShort$Zone.Name %in% c("OGChoiceRedReason", "OGChoiceBlueReason"), "outgroupChoiceReason",
+                                if_else(gameChoiceShort$Zone.Name %in% c("IGChoiceRedCooperative", "IGChoiceRedCompetitive", 
+                                                                         "IGChoiceBlueCooperative", "IGChoiceBlueCompetitive"), 
+                                        "ingroupChoice", 
+                                if_else(gameChoiceShort$Zone.Name %in% c("OGChoiceRedCooperative", "OGChoiceRedCompetitive", 
+                                                                         "OGChoiceBlueCooperative", "OGChoiceBlueCompetitive"), 
+                                        "outgroupChoice", "Mistake"))))        
+
+gameChoiceShort <- dcast(gameChoiceShort, 
+                         Participant.Public.ID ~ ResponseType,
+                         value.var = "Response")
+
+names(gameChoiceShort)[1] <- "participantID"
+
+# MERGE
+preLab <- left_join(demo, tas, by = "participantID")
+preLab <- left_join(preLab, das, by = "participantID")
+preLab <- left_join(preLab, gameChoiceShort, by = "participantID")
+
+# REMINDER FILES
+
+# LOAD
+# tempReminderPath <- ""
+tempReminder <- list.files(tempReminderPath, pattern = "*", full.names = TRUE)
+
+namesReminder <- sub('.*\\/', '', tempReminder)
+namesReminder <- substr(namesReminder, 1, nchar(namesReminder) - 4)
+
+allReminder <- lapply(tempReminder, read.csv)
+names(allReminder) <- namesReminder
+
+list2env(allReminder, envir = .GlobalEnv)
+
+# MERGE
+reminderData <- rbind(reminderIdentificationBlueVers5, reminderIdentificationRedVers4, reminderIdentificationRedVers5)
+
+# EXIT FILES
+
+# LOAD
+# tempExitPath <- ""
+tempExit <- list.files(tempExitPath, pattern = "*", full.names = TRUE)
+
+namesExit <- sub('.*\\/', '', tempExit)
+namesExit <- substr(namesExit, 1, nchar(namesExit) - 4)
+
+allExit <- lapply(tempExit, read.csv)
+names(allExit) <- namesExit
+
+list2env(allExit, envir = .GlobalEnv)
+
+# MERGE
+exitData <- rbind(exitVers6, exitVers7)
+
+# ALL ONLINE (GORILLA) FILES
+
+# MERGE
+gorillaData <- left_join(preLab, reminderData, by = "participantID")
+gorillaData <- left_join(gorillaData, exitData, by = "participantID")
+
+# ADD EXTRA COLUMNS OR RENAME EXISTING ONES TO MATCH 2020 DATASET
+gorillaData$studyVersion <- "Lab"
+
+gorillaData$identificationBlue <- gorillaData$CI_connected_blue + gorillaData$CI_like_blue + gorillaData$CI_value_blue
+
+gorillaData$identificationRed <- gorillaData$CI_connected_red + gorillaData$CI_like_red + gorillaData$CI_value_red
+
+gorillaData$identificationDiffScore <-
+  if_else(gorillaData$team == "Red", gorillaData$identificationRed - gorillaData$identificationBlue,
+          gorillaData$identificationBlue - gorillaData$identificationRed)
+
+names(gorillaData)[55] <- "choiceIngroupBinary"
+names(gorillaData)[56] <- "reasonsIngroup"
+names(gorillaData)[57] <- "choiceOutgroupBinary"
+names(gorillaData)[58] <- "reasonsOutgroup"
+
+gorillaData$choiceIngroupBinary <- 
+  if_else(gorillaData$choiceIngroupBinary == "Cooperative", "COOPERATIVE", "COMPETITIVE")
+
+gorillaData$choiceOutgroupBinary <- 
+  if_else(gorillaData$choiceOutgroupBinary == "Cooperative", "COOPERATIVE", "COMPETITIVE")
+```
